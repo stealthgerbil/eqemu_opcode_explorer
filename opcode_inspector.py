@@ -53,181 +53,23 @@ REROUTED = {"OP_RaidJoin": "encoder re-sends as OP_RaidUpdate"}
 
 
 # ----------------------------------------------------------------------
-# Fix playbook: what to actually do for opcodes that don't reach a client.
-# Researched against upstream EQEmu (github.com/EQEmu/EQEmu, master) and this
-# server's RoF2 patch. Keys are emu opcode names; "*" applies to every client,
-# a client name overrides it. Actions:
-#   MAP        add a .conf value (layout already matches)
-#   REROUTE    translate to a different opcode the client does have (encoder below)
-#   SERVER     change the server code for this client (code below)
-#   PORT       feature needs upstream's newer implementation
-#   NOT NEEDED client has no such packet; upstream also sends it unmapped and the
-#              client ignores it. Skipping it for this client is hygiene, not a fix
-#   CUSTOM     value only exists in your modified client
-#   INVESTIGATE unclear purpose; look before changing
+# Fix playbook: human knowledge about specific opcodes lives in
+# opcode_playbook.json next to this script (see its _readme). No opcode
+# values are hard-coded; they're resolved from the .conf files at scan time.
 # ----------------------------------------------------------------------
-_RANK_XLATE = """	switch (RANK_IN) { // old 0/1/2 ranks -> RoF2 ranks, same as ENCODE(OP_SetGuildRank)
-	case 0: RANK_OUT = 5; break;  // member
-	case 1: RANK_OUT = 3; break;  // officer
-	case 2: RANK_OUT = 1; break;  // leader
-	default: RANK_OUT = RANK_IN; break;
-	}"""
+PLAYBOOK_PATH_OVERRIDE: list = []
+PLAYBOOK_FILE = Path(__file__).with_name("opcode_playbook.json")
 
-PLAYBOOK = {
-    "OP_GuildManageRemove": {"RoF2": {
-        "action": "MAP",
-        "summary": "RoF2 calls this OP_GuildMemberDelete (0x3141). Your GuildManageRemove_Struct "
-                   "{uint32 guild_id; char name[64]} is byte-identical to upstream's GuildMemberDelete_Struct, "
-                   "so mapping the opcode is enough.",
-        "conf": ["OP_GuildManageRemove=0x3141    # RoF2 OP_GuildMemberDelete, same 68-byte layout"],
-    }},
-    "OP_GuildManageStatus": {"RoF2": {
-        "action": "REROUTE",
-        "summary": "Rank changes. RoF2 uses OP_SetGuildRank (0x0b9c, upstream's OP_GuildMemberRankAltBanker), "
-                   "which your RoF2 patch already encodes. Translate GuildManageStatus into it.",
-        "ops_h": ["E(OP_GuildManageStatus)"],
-        "code": """ENCODE(OP_GuildManageStatus)
-{
-	ENCODE_LENGTH_EXACT(GuildManageStatus_Struct);
-	SETUP_DIRECT_ENCODE(GuildManageStatus_Struct, structs::GuildSetRank_Struct);
 
-	eq->GuildID = emu->guild_id;
-""" + _RANK_XLATE.replace("RANK_IN", "emu->newrank").replace("RANK_OUT", "eq->Rank") + """
-	strn0cpy(eq->MemberName, emu->name, sizeof(eq->MemberName));
-	eq->Unknown76 = 1;              // same as ENCODE(OP_SetGuildRank)
-
-	__packet->SetOpcode(OP_SetGuildRank);  // wire opcode comes from OP_SetGuildRank's .conf entry
-	FINISH_ENCODE();
-}""",
-    }},
-    "OP_GuildManageAdd": {"RoF2": {
-        "action": "REROUTE",
-        "summary": "Member joined. RoF2 uses OP_GuildMemberAdd (0x2925); upstream sends it with GuildMemberAdd_Struct. "
-                   "Needs a new emu opcode, a .conf line, a wire struct and an encoder.",
-        "conf": ["OP_GuildMemberAdd=0x2925    # upstream value"],
-        "extra": "emu_oplist.h: add N(OP_GuildMemberAdd), at the END of the list so existing values don't shift.\n\n"
-                 "rof2_structs.h (upstream layout):\n"
-                 "struct GuildMemberAdd_Struct {\n"
-                 "/*000*/ uint32 guild_id;\n/*004*/ uint32 unknown04;\n/*008*/ uint32 unknown08;\n"
-                 "/*012*/ uint32 unknown12;\n/*016*/ uint32 level;\n/*020*/ uint32 class_;\n/*024*/ uint32 rank_;\n"
-                 "/*028*/ uint32 guild_show;\n/*032*/ uint32 zone_id;\n/*036*/ uint32 last_on;\n"
-                 "/*040*/ char   player_name[64];\n};",
-        "ops_h": ["E(OP_GuildManageAdd)"],
-        "code": """ENCODE(OP_GuildManageAdd)
-{
-	ENCODE_LENGTH_EXACT(GuildJoin_Struct);
-	SETUP_DIRECT_ENCODE(GuildJoin_Struct, structs::GuildMemberAdd_Struct);
-
-	eq->guild_id = emu->guild_id;
-	eq->level    = emu->level;
-	eq->class_   = emu->class_;
-""" + _RANK_XLATE.replace("RANK_IN", "emu->rank").replace("RANK_OUT", "eq->rank_") + """
-	eq->zone_id  = emu->zoneid;
-	eq->last_on  = time(nullptr);
-	strn0cpy(eq->player_name, emu->name, sizeof(eq->player_name));
-
-	__packet->SetOpcode(OP_GuildMemberAdd);
-	FINISH_ENCODE();
-}""",
-    }},
-    "OP_ZoneGuildList": {"*": {
-        "action": "SERVER",
-        "summary": "Upstream removed this packet entirely. RoF2 gets the guild list from OP_GuildsList, which your "
-                   "RoF2 patch already encodes. For RoF2 clients send (or rely on) OP_GuildsList instead; check what "
-                   "the sender in guild.cpp is for before removing it.",
-    }},
-    "OP_MultiLineMsg": {"*": {
-        "action": "SERVER",
-        "summary": "No RoF2 opcode (upstream sends it unmapped, so RoF2 players never see these messages). "
-                   "Deliver it as ordinary chat for RoF2.",
-        "code": """// worldserver.cpp, ServerOP_MultiLineMsg handler, replace the OP_MultiLineMsg send:
-if (client->ClientVersion() >= EQ::versions::ClientVersion::RoF2) {
-	for (const auto &line : SplitString(mlm->message, '\\n'))   // check the actual line separator
-		client->Message(Chat::White, line.c_str());
-} else {
-	// existing OP_MultiLineMsg packet
-}""",
-    }},
-    "OP_ItemLinkText": {"*": {
-        "action": "INVESTIGATE",
-        "summary": "Upstream no longer has this packet. RoF2 shows item details via OP_ItemLinkResponse (encoded "
-                   "by your patch). Check what the senders in client.cpp deliver and route it through "
-                   "OP_ItemLinkResponse or a chat message with an item link.",
-    }},
-    "OP_LFGAppearance": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "No RoF2 opcode; upstream sends it unmapped too. Other players see the LFG flag from spawn data "
-                   "(the lfg field in OP_ZoneSpawns/OP_NewSpawn), not from this packet.",
-        "eat": True,
-    }},
-    "OP_ZoneServerReady": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "RoF2 finishes zone-in without it; upstream sends it unmapped on every zone-in.",
-        "eat": True,
-    }},
-    "OP_PreLogoutReply": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "No RoF2 opcode; upstream sends it unmapped. Camp/logout runs on OP_Camp and OP_Logout.",
-        "eat": True,
-    }},
-    "OP_TargetReject": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "No RoF2 opcode; upstream sends it unmapped. The player still gets the 'You cannot see your target' message.",
-        "eat": True,
-    }},
-    "OP_GMEndTrainingResponse": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "No RoF2 opcode; upstream sends it unmapped. The trainer window closes client-side.",
-        "eat": True,
-    }},
-    "OP_PetitionUpdate": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "RoF2 has no petition window opcodes (all 0 upstream). GMs use #petition commands.",
-        "eat": True,
-    }},
-    "OP_PetitionCheckout": {"*": {
-        "action": "NOT NEEDED",
-        "summary": "RoF2 has no petition window opcodes (all 0 upstream). GMs use #petition commands.",
-        "eat": True,
-    }},
-    "OP_TraderItemUpdate": {"*": {
-        "action": "PORT",
-        "summary": "Part of the old bazaar protocol. Upstream rewrote the bazaar around OP_TraderShop, "
-                   "OP_BazaarSearch and OP_Trader actions; RoF2 trader updates only work after porting that.",
-    }},
-    "OP_Bazaar": {"*": {
-        "action": "PORT",
-        "summary": "Old bazaar protocol; no RoF2 opcode. See upstream's bazaar rewrite (OP_TraderShop / OP_BazaarSearch).",
-    }},
-    "OP_TraderBuy": {"*": {
-        "action": "PORT",
-        "summary": "RoF2 doesn't send OP_TraderBuy; purchases arrive as OP_TraderShop actions in upstream's bazaar. "
-                   "Your D(OP_TraderBuy) can never run for RoF2.",
-    }},
-    "OP_ResetCampTimer": {
-        "RoF2": {"action": "NOT NEEDED",
-                 "summary": "Handle_OP_Camp already uses the server-side camp_timer for RoF2; this packet is for "
-                            "your modified SoD client.", "eat": True},
-        "SoD": {"action": "CUSTOM",
-                "summary": "Only your modified SoD client knows this opcode. Add OP_ResetCampTimer=0x???? to "
-                           "patch_SoD.conf with the value from that client."},
-    },
-    "OP_Diag": {"*": {
-        "action": "CUSTOM",
-        "summary": "Private anti-cheat diagnostics (PRODUCTION builds, libsoddiag). Only a modified client sends it; "
-                   "it has no opcode in either .conf, so it never arrives. Leave it unless that client is in use.",
-    }},
-    "OP_0x0347": {"*": {
-        "action": "INVESTIGATE",
-        "summary": "Placeholder name with no value in any .conf. Find what the sender in client_packet.cpp was "
-                   "meant to do; delete the send if it's leftover.",
-    }},
-    "OP_GroupCancelInvite": {"RoF2": {
-        "action": "MAP",
-        "summary": "RoF2 calls it OP_CancelInvite (0x2a50). Your patch_SoD.conf already maps both names to one value.",
-        "conf": ["OP_GroupCancelInvite=0x2a50    # = OP_CancelInvite"],
-    }},
-}
+def load_playbook(path: Path | None = None) -> dict:
+    path = Path(path) if path else PLAYBOOK_FILE
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("playbook", {})
+    except Exception as e:
+        print(f"Couldn't read {path}: {e}", file=sys.stderr)
+        return {}
 
 
 OUT_RE = re.compile(r"EQApplicationPacket[ *(]*[A-Za-z_0-9]*\(?\s*(OP_[A-Za-z0-9_]+)|SetOpcode\(\s*(OP_[A-Za-z0-9_]+)")
@@ -351,6 +193,7 @@ class Scan:
         self.patches: list = []
         self.rows: list = []
         self.unknown_conf_names: dict = {}
+        self.playbook = load_playbook(PLAYBOOK_PATH_OVERRIDE[0] if PLAYBOOK_PATH_OVERRIDE else None)
 
     # ---------- discovery ----------
     def run(self, fetch_upstream=False):
@@ -453,6 +296,30 @@ class Scan:
             self.add_upstream_evidence()
         return self
 
+    @staticmethod
+    def _verify_playbook_layout(v, p, lc):
+        fd = v.get("fix_detail") or {}
+        pair = fd.get("_verify_layout")
+        if not pair:
+            return
+        ours, up = pair
+        la = lc.ours_internal.layout(ours) or lc.ours_wire[p.name].layout(ours)
+        lb = lc.up_internal.layout(up) or lc.up_wire[p.name].layout(up)
+        if not la or not lb:
+            msg = f"couldn't verify layout: {ours if not la else up} not found"
+        else:
+            bad = [x for x in align_by_offset(la[0], lb[0]) if x[2] not in ("same", "renamed")]
+            msg = (f"layout verified: {ours} and upstream {up} are both {la[1]} bytes" if not bad and la[1] == lb[1]
+                   else f"LAYOUT MISMATCH: {ours} is {la[1]} bytes, upstream {up} is {lb[1]} bytes, "
+                        f"{len(bad)} field difference(s). Don't just map it")
+        fd = dict(fd)
+        fd.setdefault("warnings", [])
+        if msg.startswith("layout verified"):
+            fd["verified"] = msg
+        else:
+            fd["warnings"] = fd["warnings"] + [msg]
+        v["fix_detail"] = fd
+
     def add_upstream_evidence(self):
         """Links to upstream sources and a layout verdict for every opcode upstream maps."""
         try:
@@ -473,6 +340,7 @@ class Scan:
                     links.append((f"value as {al}", gh_link(f"utils/patches/patch_{p.conf_name}.conf", p.upstream_lines[al])))
                 if not p.upstream.get(r.opcode):
                     v["links"], v["layout"] = links, ""
+                    self._verify_playbook_layout(v, p, lc)
                     continue
                 res = lc.compare(r.opcode, p.name)
                 for kind in ("ENCODE", "DECODE"):
@@ -484,6 +352,7 @@ class Scan:
                     links.append((f"upstream struct {w['up_name']}", gh_link(*w["up_loc"])))
                 v["links"] = links
                 v["layout"] = lc.verdict(res)
+                self._verify_playbook_layout(v, p, lc)
                 fd = v.get("fix_detail") or {}
                 if fd.get("action") == "MAP" and "upstream value" in " ".join(fd.get("conf", [])):
                     fd = dict(fd)
@@ -514,12 +383,64 @@ class Scan:
         return d, lines
 
     # ---------- status ----------
-    @staticmethod
-    def suggest(op, p, row, others, alias, alias_val, up_val, out_st):
-        pb = PLAYBOOK.get(op, {})
+    def resolve(self, name, p):
+        """Value of an opcode name for this client: ours first, then upstream. Returns (int|None, source)."""
+        if p.conf.get(name):
+            return p.conf[name], "your .conf"
+        if p.upstream.get(name):
+            return p.upstream[name], "upstream"
+        return None, ""
+
+    def apply_playbook(self, op, p, entry):
+        e = dict(entry)
+        warn = []
+        fmtvals = {"client": p.name}
+        conf = list(e.get("conf", []))
+        if e.get("map_to"):
+            v, src = self.resolve(e["map_to"], p)
+            fmtvals["map_to"] = e["map_to"]
+            fmtvals["map_value"] = f"0x{v:04x}" if v else "value unknown"
+            if v:
+                conf.append(f"{op}=0x{v:04x}    # same as {e['map_to']} ({src})")
+            else:
+                warn.append(f"no value found for {e['map_to']}; tick 'Compare with upstream EQEmu'")
+        if e.get("new_opcode"):
+            v, src = self.resolve(e["new_opcode"], p)
+            if v:
+                conf.append(f"{e['new_opcode']}=0x{v:04x}    # {src} value")
+            else:
+                warn.append(f"no value found for {e['new_opcode']}; tick 'Compare with upstream EQEmu'")
+        if e.get("expect_upstream_unmapped") and p.upstream.get(op):
+            warn.append(f"playbook says {p.name} has no such packet, but upstream now maps {op} to "
+                        f"0x{p.upstream[op]:04x}. Re-check this entry")
+        req = e.get("requires_encoder")
+        if req and req not in p.encoders:
+            warn.append(f"advice relies on your {p.name} patch encoding {req}, which it doesn't")
+        if e.get("same_layout"):
+            e["_verify_layout"] = list(e["same_layout"])
+
+        def fill(text):
+            text = re.sub(r"\{value:(OP_\w+)\}",
+                          lambda m: (lambda v: f"0x{v:04x}" if v else "value unknown")(self.resolve(m.group(1), p)[0]),
+                          text)
+            try:
+                return text.format(**fmtvals)
+            except (KeyError, IndexError):
+                return text
+
+        e["summary"] = fill(e.get("summary", ""))
+        if e.get("code"):
+            e["code"] = fill(e["code"].replace("{", "{{").replace("}", "}}").replace("{{client}}", "{client}"))
+        e["conf"] = conf
+        if warn:
+            e["warnings"] = warn
+        return e
+
+    def suggest(self, op, p, row, others, alias, alias_val, up_val, out_st):
+        pb = self.playbook.get(op, {})
         entry = pb.get(p.name) or pb.get("*")
         if entry:
-            return dict(entry)
+            return self.apply_playbook(op, p, entry)
         if alias_val:
             return {"action": "MAP", "summary": f"Same packet as {alias} in this client.",
                     "conf": [f"{op}=0x{alias_val:04x}    # = {alias}"]}
@@ -587,7 +508,7 @@ class Scan:
                     in_st = "Passthrough: verify layout"
 
             if unmapped and (out_st.startswith("BROKEN") or in_st.startswith("UNREACHABLE")):
-                fixd = Scan.suggest(op, p, row, others, alias, alias_val, up_val, out_st)
+                fixd = self.suggest(op, p, row, others, alias, alias_val, up_val, out_st)
             if val and up_val and val != up_val:
                 fixd = fixd or {}
                 fixd = dict(fixd, check=f"ours 0x{val:04x} vs upstream 0x{up_val:04x}: verify which is right")
@@ -595,6 +516,8 @@ class Scan:
         fix_txt = ""
         if fixd:
             fix_txt = (f"{fixd['action']}: {fixd['summary']}" if fixd.get("action") else "")
+            if fixd.get("warnings"):
+                fix_txt = "WARNING (" + "; ".join(fixd["warnings"]) + ") " + fix_txt
             if fixd.get("check"):
                 fix_txt = (fix_txt + " | " if fix_txt else "") + "CHECK " + fixd["check"]
         return {
@@ -670,6 +593,10 @@ class Scan:
                     out.append(f"    {d['summary']}")
                 if d.get("check"):
                     out.append(f"    CHECK: {d['check']}")
+                for w in d.get("warnings", []):
+                    out.append(f"    WARNING: {w}")
+                if d.get("verified"):
+                    out.append(f"    {d['verified']}")
                 v = r.per_client.get(client, {})
                 if v.get("layout") and v["layout"] not in d.get("summary", ""):
                     out.append(f"    {v['layout']}")
@@ -1119,6 +1046,8 @@ def align_by_offset(a, b):
     def key(f):
         return (f.off is None, f.off if f.off is not None else 0)
     a, b = sorted(a, key=key), sorted(b, key=key)
+    pos_a = {norm(f.name): f.off for f in a}
+    pos_b = {norm(f.name): f.off for f in b}
     i = j = 0
     rows = []
     while i < len(a) or j < len(b):
@@ -1130,8 +1059,11 @@ def align_by_offset(a, b):
                 st = "size differs"
             elif na == nb:
                 st = "same"
-            elif na.startswith("unknown") or nb.startswith("unknown") or "unknown" in na or "unknown" in nb:
-                st = "renamed"
+            elif (na in pos_b and pos_b[na] != fa.off) or (nb in pos_a and pos_a[nb] != fb.off):
+                st = "different"      # field exists on both sides but at another offset: swapped/moved
+            elif "unknown" in na or "unknown" in nb or \
+                    re.sub(r"\[.*", "", fa.type.replace(" ", "")) == re.sub(r"\[.*", "", fb.type.replace(" ", "")):
+                st = "renamed"        # same bytes, different name
             else:
                 st = "different"
             rows.append((fa, fb, st))
@@ -1556,6 +1488,10 @@ def run_gui(initial_root: str | None, fetch_upstream: bool):
             fd = v.get("fix_detail") or {}
             for cl in fd.get("conf", []):
                 lines.append(f"    conf:     {cl}")
+            for w in fd.get("warnings", []):
+                lines.append(f"    WARNING:  {w}")
+            if fd.get("verified"):
+                lines.append(f"    check:    {fd['verified']}")
             if v.get("layout"):
                 lines.append(f"    layout:   {v['layout']}")
             for label, url in v.get("links", []):
@@ -1881,9 +1817,12 @@ def main():
     ap.add_argument("--compare", metavar="OPCODE", help="Print ours-vs-upstream struct/encoder comparison for an opcode")
     ap.add_argument("--client", default="RoF2", help="Client for --compare / --struct-report (default RoF2)")
     ap.add_argument("--struct-report", metavar="CSV", help="Write size/layout differences for every shared struct")
+    ap.add_argument("--playbook", help="Use this playbook JSON instead of opcode_playbook.json next to the script")
     ap.add_argument("--upstream", action="store_true", help="Compare with upstream EQEmu .conf files (internet)")
     a = ap.parse_args()
     CONF_DIRS.extend(Path(d) for d in a.conf_dir)
+    if a.playbook:
+        PLAYBOOK_PATH_OVERRIDE.append(a.playbook)
 
     if a.no_gui or a.csv or a.html or a.fixes or a.compare or a.struct_report:
         if not a.repo:
